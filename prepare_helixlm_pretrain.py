@@ -2,20 +2,16 @@
 """
 Prepare pretraining datasets for HelixLM models.
 
+TRULY memory-efficient version using chunked writing.
+Writes samples in chunks, processes train/val split using indices.
+
 Creates model-size-relevant subsets of:
   - HuggingFaceFW/fineweb-edu   (primary pretraining)
   - open-web-math/open-web-math  (math/reasoning boost, optional)
 
-Math ratio is expressed as a percentage of the PRETRAINING budget.
-Default: 1% math / 99% FineWeb-Edu.
-
 Usage:
-    python prepare_helixlm_pretrain.py --model-size tiny
-    python prepare_helixlm_pretrain.py --model-size small --hf-org myorg --push-to-hub
-    python prepare_helixlm_pretrain.py --model-size tiny --total-tokens 5000000
-    python prepare_helixlm_pretrain.py --model-size base --fineweb-subset sample-100BT
-    python prepare_helixlm_pretrain.py --model-size tiny --no-include-math
-    python prepare_helixlm_pretrain.py --model-size base --math-ratio 0.005
+    python prepare_helixlm_pretrain_streaming.py --model-size tiny
+    python prepare_helixlm_pretrain_streaming.py --model-size medium --total-tokens 1500000000
 """
 
 import argparse
@@ -24,17 +20,20 @@ import os
 import sys
 import json
 import random
+import tempfile
+import shutil
 from math import ceil
 from typing import Optional, Dict, List, Any, Iterator, Tuple
 from datetime import datetime
 
-from datasets import load_dataset, Dataset, DatasetDict, Features, Value
+import numpy as np
+from datasets import load_dataset, Dataset, DatasetDict, Features, Value, concatenate_datasets
 
-HF_TOKEN os.getenv("HF_TOKEN")
+HF_TOKEN = os.getenv("HF_TOKEN")
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Dataset configuration
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 PRETRAIN_DATASETS = {
     "fineweb-edu": {
@@ -66,10 +65,9 @@ TOKENS_PER_SAMPLE = {
     "open-web-math": 800,
 }
 
+# Process in chunks to limit memory
+CHUNK_SIZE = 25000  # samples per chunk
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def generate_dataset_name(
     model_size: str,
@@ -92,10 +90,11 @@ def stream_dataset_texts(
     dataset_name: str,
     subset: Optional[str],
     num_samples: int,
-    text_column: Optional[str] = None,
+    text_column: str = "text",
     shuffle_buffer: int = 10000,
     seed: int = 42,
-) -> Iterator[str]:
+) -> Iterator[Tuple[str, str]]:
+    """Yield (text, source) tuples."""
     print(f"    Streaming from {dataset_name}" + (f" (subset={subset})" if subset else ""))
     ds = load_dataset(
         dataset_name,
@@ -106,74 +105,21 @@ def stream_dataset_texts(
     ds = ds.shuffle(seed=seed, buffer_size=shuffle_buffer)
 
     count = 0
+    source_label = "fineweb-edu" if "fineweb" in dataset_name else "open-web-math"
+    
     for sample in ds:
         if count >= num_samples:
             break
 
-        text = sample.get(text_column, "") if text_column else ""
+        text = sample.get(text_column, "")
         if isinstance(text, str) and text.strip():
-            yield text.strip()
+            yield (text.strip(), source_label)
             count += 1
 
     print(f"    Collected {count:,} samples")
 
 
-def stream_from_shards(
-    dataset_name: str,
-    num_samples: int,
-    seed: int = 42,
-) -> Iterator[str]:
-    from huggingface_hub import HfApi
-    import pyarrow.parquet as pq
-
-    api = HfApi()
-    print(f"    Discovering shards for {dataset_name} ...")
-    repo_files = list(api.list_repo_files(dataset_name, repo_type="dataset"))
-    parquet_files = [f for f in repo_files if f.endswith(".parquet") and "/data/" in f]
-
-    if not parquet_files:
-        print(f"    WARNING: No parquet shards found. Falling back to standard streaming.")
-        yield from stream_dataset_texts(dataset_name, None, num_samples, "text", seed=seed)
-        return
-
-    print(f"    Found {len(parquet_files)} parquet shards")
-    random.seed(seed)
-    random.shuffle(parquet_files)
-
-    collected = 0
-    for shard_path in parquet_files:
-        if collected >= num_samples:
-            break
-        try:
-            local_path = api.hf_hub_download(
-                dataset_name,
-                shard_path,
-                repo_type="dataset",
-                local_dir=os.path.join(os.getcwd(), "_temp_shards"),
-                local_dir_use_symlinks=False,
-            )
-            table = pq.read_table(local_path)
-            rows = table.to_pylist()
-            random.shuffle(rows)
-
-            for row in rows:
-                if collected >= num_samples:
-                    break
-                text = row.get("text", "")
-                if isinstance(text, str) and text.strip():
-                    yield text.strip()
-                    collected += 1
-
-            del table, rows
-            gc.collect()
-        except Exception as e:
-            print(f"    WARNING: Failed to process shard {shard_path}: {e}")
-            continue
-
-    print(f"    Collected {collected:,} samples from shards")
-
-
-def create_dataset_dict(
+def create_dataset_chunked(
     model_size: str,
     total_tokens: Optional[int] = None,
     fineweb_subset: str = "sample-10BT",
@@ -184,6 +130,15 @@ def create_dataset_dict(
     include_math: bool = True,
     math_ratio: float = 0.01,
 ) -> Tuple[DatasetDict, Dict[str, Any]]:
+    """
+    Memory-efficient dataset creation using chunked processing.
+    
+    Strategy:
+    1. Stream samples from both sources
+    2. Store in temporary chunked files (or memory-mapped structure)
+    3. Shuffle indices deterministically
+    4. Create train/val split by selecting appropriate chunks
+    """
     random.seed(seed)
 
     if total_tokens is None:
@@ -193,7 +148,7 @@ def create_dataset_dict(
         raise ValueError(f"math_ratio must be in [0.0, 1.0], got {math_ratio}")
 
     print(f"\n{'='*60}")
-    print(f"HelixLM Pretraining Dataset Preparation")
+    print(f"HelixLM Pretraining Dataset Preparation (Chunked/Streaming)")
     print(f"{'='*60}")
     print(f"Model size: {model_size}")
     print(f"Total token budget: {total_tokens:,}")
@@ -201,7 +156,7 @@ def create_dataset_dict(
     print(f"Include math: {include_math}")
     if include_math:
         print(f"Math ratio: {math_ratio:.2%} of the pretraining budget")
-    print(f"Shard mode: {use_shards}")
+    print(f"Chunk size: {CHUNK_SIZE:,} samples")
     print(f"{'='*60}\n")
 
     if include_math:
@@ -222,81 +177,156 @@ def create_dataset_dict(
         print(f"  OpenWebMath:    SKIPPED")
     print()
 
-    # Pretraining data
-    print("Streaming pretraining data...")
-    pretrain_texts = []
-    pretrain_sources = []
-
-    print("  Loading FineWeb-Edu...")
-    if use_shards and fineweb_subset == "full":
-        fw_iter = stream_from_shards(
-            PRETRAIN_DATASETS["fineweb-edu"]["name"],
-            fineweb_samples,
-            seed=seed,
-        )
-    else:
-        fw_iter = stream_dataset_texts(
+    # Collect samples in chunks to disk
+    temp_dir = tempfile.mkdtemp(prefix="helixlm_chunks_")
+    print(f"Using temp directory: {temp_dir}")
+    
+    try:
+        features = Features({
+            "text": Value("string"),
+            "source": Value("string"),
+        })
+        
+        # Stream and save in chunks
+        all_chunk_files = []
+        current_chunk = {"text": [], "source": []}
+        chunk_num = 0
+        total_samples = 0
+        fw_samples = 0
+        owm_samples = 0
+        
+        def save_chunk():
+            nonlocal chunk_num, all_chunk_files
+            if len(current_chunk["text"]) == 0:
+                return
+            chunk_path = os.path.join(temp_dir, f"chunk_{chunk_num:05d}.arrow")
+            ds = Dataset.from_dict(current_chunk, features=features)
+            ds.save_to_disk(chunk_path)
+            all_chunk_files.append(chunk_path)
+            print(f"    Saved chunk {chunk_num}: {len(current_chunk['text']):,} samples")
+            current_chunk["text"].clear()
+            current_chunk["source"].clear()
+            chunk_num += 1
+            gc.collect()
+        
+        # Stream FineWeb-Edu
+        print("Streaming FineWeb-Edu...")
+        for text, source in stream_dataset_texts(
             PRETRAIN_DATASETS["fineweb-edu"]["name"],
             fineweb_subset if fineweb_subset else PRETRAIN_DATASETS["fineweb-edu"]["subset"],
             fineweb_samples,
             text_column=PRETRAIN_DATASETS["fineweb-edu"]["text_column"],
-            shuffle_buffer=shuffle_buffer,
             seed=seed,
-        )
-
-    for text in fw_iter:
-        pretrain_texts.append(text)
-        pretrain_sources.append("fineweb-edu")
-    print(f"    FineWeb-Edu: {len(pretrain_texts):,} samples\n")
-
-    if include_math and openwebmath_samples > 0:
-        print("  Loading OpenWebMath...")
-        owm_iter = stream_dataset_texts(
-            PRETRAIN_DATASETS["open-web-math"]["name"],
-            PRETRAIN_DATASETS["open-web-math"]["subset"],
-            openwebmath_samples,
-            text_column=PRETRAIN_DATASETS["open-web-math"]["text_column"],
-            shuffle_buffer=shuffle_buffer,
-            seed=seed + 1,
-        )
-
-        owm_count = 0
-        for text in owm_iter:
-            pretrain_texts.append(text)
-            pretrain_sources.append("open-web-math")
-            owm_count += 1
-        print(f"    OpenWebMath: {owm_count:,} samples")
-    else:
-        owm_count = 0
-        print("  Skipping OpenWebMath.\n")
-
-    print(f"  Total pretraining: {len(pretrain_texts):,} samples\n")
-
-    # Shuffle and split
-    print("Shuffling and creating train/val splits...")
-
-    indices = list(range(len(pretrain_texts)))
-    random.shuffle(indices)
-    split_idx = int(len(pretrain_texts) * (1 - val_split))
-    train_idx = indices[:split_idx]
-    val_idx = indices[split_idx:]
-
-    features = Features({
-        "text": Value("string"),
-        "source": Value("string"),
-    })
-
-    dataset_dict = DatasetDict({
-        "pretrain_train": Dataset.from_dict({
-            "text": [pretrain_texts[i] for i in train_idx],
-            "source": [pretrain_sources[i] for i in train_idx],
-        }, features=features),
-        "pretrain_val": Dataset.from_dict({
-            "text": [pretrain_texts[i] for i in val_idx],
-            "source": [pretrain_sources[i] for i in val_idx],
-        }, features=features),
-    })
-
+        ):
+            current_chunk["text"].append(text)
+            current_chunk["source"].append(source)
+            fw_samples += 1
+            total_samples += 1
+            
+            if len(current_chunk["text"]) >= CHUNK_SIZE:
+                save_chunk()
+        
+        # Stream OpenWebMath
+        if openwebmath_samples > 0:
+            print("Streaming OpenWebMath...")
+            for text, source in stream_dataset_texts(
+                PRETRAIN_DATASETS["open-web-math"]["name"],
+                PRETRAIN_DATASETS["open-web-math"]["subset"],
+                openwebmath_samples,
+                text_column=PRETRAIN_DATASETS["open-web-math"]["text_column"],
+                seed=seed + 1,
+            ):
+                current_chunk["text"].append(text)
+                current_chunk["source"].append(source)
+                owm_samples += 1
+                total_samples += 1
+                
+                if len(current_chunk["text"]) >= CHUNK_SIZE:
+                    save_chunk()
+        
+        # Save final partial chunk
+        save_chunk()
+        
+        print(f"\nTotal samples streamed: {total_samples:,}")
+        print(f"  FineWeb-Edu: {fw_samples:,}")
+        print(f"  OpenWebMath: {owm_samples:,}")
+        print(f"  Chunks: {len(all_chunk_files)}")
+        
+        if total_samples == 0:
+            raise ValueError("No samples collected!")
+        
+        # Create shuffled train/val indices
+        print("\nCreating train/val split indices...")
+        indices = np.arange(total_samples)
+        np.random.seed(seed + 10)
+        np.random.shuffle(indices)
+        
+        split_idx = int(total_samples * (1 - val_split))
+        train_indices_set = set(indices[:split_idx].tolist())
+        val_indices_set = set(indices[split_idx:].tolist())
+        
+        del indices
+        gc.collect()
+        
+        print(f"  Train samples: {len(train_indices_set):,}")
+        print(f"  Val samples: {len(val_indices_set):,}")
+        
+        # Load chunks and split into train/val
+        print("\nProcessing chunks into train/val datasets...")
+        train_chunks = []
+        val_chunks = []
+        global_idx = 0
+        
+        for chunk_file in sorted(all_chunk_files):
+            chunk_ds = Dataset.load_from_disk(chunk_file)
+            chunk_size = len(chunk_ds)
+            
+            # Determine which samples in this chunk go to train vs val
+            chunk_train_indices = []
+            chunk_val_indices = []
+            
+            for i in range(chunk_size):
+                if global_idx + i in train_indices_set:
+                    chunk_train_indices.append(i)
+                else:
+                    chunk_val_indices.append(i)
+            
+            if chunk_train_indices:
+                train_chunk = chunk_ds.select(chunk_train_indices)
+                train_chunks.append(train_chunk)
+            
+            if chunk_val_indices:
+                val_chunk = chunk_ds.select(chunk_val_indices)
+                val_chunks.append(val_chunk)
+            
+            del chunk_ds
+            gc.collect()
+            
+            global_idx += chunk_size
+            
+            if chunk_file == all_chunk_files[-1] or global_idx % (CHUNK_SIZE * 4) == 0:
+                print(f"  Processed {global_idx:,}/{total_samples:,} samples...")
+        
+        # Concatenate all chunks
+        print("\nConcatenating chunks...")
+        train_dataset = concatenate_datasets(train_chunks) if train_chunks else Dataset.from_dict({"text": [], "source": []}, features=features)
+        val_dataset = concatenate_datasets(val_chunks) if val_chunks else Dataset.from_dict({"text": [], "source": []}, features=features)
+        
+        # Clean up chunks
+        del train_chunks, val_chunks
+        gc.collect()
+        
+        dataset_dict = DatasetDict({
+            "pretrain_train": train_dataset,
+            "pretrain_val": val_dataset,
+        })
+        
+    finally:
+        # Cleanup temp dir
+        print(f"\nCleaning up temp directory: {temp_dir}")
+        shutil.rmtree(temp_dir, ignore_errors=True)
+    
+    # Metadata
     used_ratios = {
         "fineweb-edu": 1.0 - math_ratio if include_math else 1.0,
         "open-web-math": math_ratio if include_math else 0.0,
@@ -308,11 +338,11 @@ def create_dataset_dict(
         "token_ratios": used_ratios,
         "include_math": include_math,
         "math_ratio_of_pretrain": math_ratio if include_math else 0.0,
-        "fineweb_edu_samples": len([s for s in pretrain_sources if s == "fineweb-edu"]),
-        "openwebmath_samples": len([s for s in pretrain_sources if s == "open-web-math"]),
-        "pretrain_train_samples": len(train_idx),
-        "pretrain_val_samples": len(val_idx),
-        "pretrain_total_samples": len(pretrain_texts),
+        "fineweb_edu_samples": fw_samples,
+        "openwebmath_samples": owm_samples,
+        "pretrain_train_samples": len(train_dataset),
+        "pretrain_val_samples": len(val_dataset),
+        "pretrain_total_samples": total_samples,
         "val_split": val_split,
         "fineweb_subset": fineweb_subset,
         "use_shards": use_shards,
@@ -321,24 +351,22 @@ def create_dataset_dict(
     }
 
     print(f"\nDataset splits:")
-    print(f"  pretrain_train:  {len(train_idx):,} samples")
-    print(f"  pretrain_val:    {len(val_idx):,} samples")
+    print(f"  pretrain_train:  {len(train_dataset):,} samples")
+    print(f"  pretrain_val:    {len(val_dataset):,} samples")
 
     return dataset_dict, metadata
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Prepare HelixLM pretraining datasets",
+        description="Prepare HelixLM pretraining datasets (memory-efficient chunked)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   %(prog)s --model-size tiny
+  %(prog)s --model-size medium --total-tokens 1500000000
   %(prog)s --model-size small --hf-org myorg --push-to-hub
-  %(prog)s --model-size tiny --total-tokens 10000000 --fineweb-subset sample-100BT
-  %(prog)s --model-size base --use-shards --fineweb-subset full
-  %(prog)s --model-size tiny --no-include-math
-  %(prog)s --model-size small --math-ratio 0.005
+  %(prog)s --model-size base --fineweb-subset sample-100BT
         """,
     )
     parser.add_argument("--model-size", type=str, default="tiny", choices=list(MODEL_SIZE_TOKENS.keys()))
@@ -348,14 +376,15 @@ Examples:
     parser.add_argument("--val-split", type=float, default=0.02)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--include-math", action="store_true", default=True, help="Include OpenWebMath (default: True)")
-    parser.add_argument("--no-include-math", action="store_false", dest="include_math", help="Exclude OpenWebMath; use only FineWeb-Edu")
-    parser.add_argument("--math-ratio", type=float, default=0.01, help="Fraction of the pretraining budget for OpenWebMath (default: 0.01 = 1%%)")
+    parser.add_argument("--no-include-math", action="store_false", dest="include_math", help="Exclude OpenWebMath")
+    parser.add_argument("--math-ratio", type=float, default=0.01, help="Fraction for OpenWebMath (default: 0.01 = 1%%)")
     parser.add_argument("--hf-org", type=str, default=None)
     parser.add_argument("--hf-repo", type=str, default=None)
     parser.add_argument("--push-to-hub", action="store_true")
     parser.add_argument("--output-dir", type=str, default="./helixlm-datasets")
     parser.add_argument("--save-local", action="store_true", default=True)
     parser.add_argument("--shuffle-buffer", type=int, default=10000)
+    parser.add_argument("--chunk-size", type=int, default=CHUNK_SIZE, help="Samples per chunk when writing to disk")
     return parser.parse_args()
 
 
@@ -363,7 +392,12 @@ def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
-    dataset_dict, metadata = create_dataset_dict(
+    # Override CHUNK_SIZE if provided
+    global CHUNK_SIZE
+    if args.chunk_size:
+        CHUNK_SIZE = args.chunk_size
+
+    dataset_dict, metadata = create_dataset_chunked(
         model_size=args.model_size,
         total_tokens=args.total_tokens,
         fineweb_subset=args.fineweb_subset,
