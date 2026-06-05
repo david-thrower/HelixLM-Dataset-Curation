@@ -181,10 +181,10 @@ def process_dolly_dataset(
     train_ds = ds.select(train_indices)
     val_ds = ds.select(val_indices)
     
-    dataset_dict = DatasetDict({{
+    dataset_dict = DatasetDict({
         "train": train_ds,
         "val": val_ds,
-    }})
+    })
     
     print(f"  Train: {{len(train_ds):,}} samples")
     print(f"  Val:   {{len(val_ds):,}} samples")
