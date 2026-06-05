@@ -41,9 +41,9 @@ print("Loading GPT2 tokenizer...")
 base_tokenizer = AutoTokenizer.from_pretrained('gpt2')
 
 # Add special tokens to GPT2 tokenizer
-special_tokens = {{
+special_tokens = {
     "additional_special_tokens": [IM_START, IM_END]
-}}
+}
 num_added = base_tokenizer.add_special_tokens(special_tokens)
 
 # GPT2 doesn't have a pad token by default, set it to eos_token
@@ -197,7 +197,7 @@ def process_dolly_dataset(
     print(f"\\nRepo ID: {{REPO_ID}}")
     
     # Metadata
-    metadata = {{
+    metadata = {
         "source": "databricks/databricks-dolly-15k",
         "original_rows": original_len,
         "filtered_rows": filtered_len,
@@ -210,7 +210,7 @@ def process_dolly_dataset(
         "seed": seed,
         "created": datetime.now().isoformat(),
         "format_version": "v1_dolly",
-    }}
+    }
     
     return dataset_dict, metadata, REPO_ID
 
