@@ -296,35 +296,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-'''
-
-# Save to file
-output_path = "/mnt/agents/output/prepare_dolly_chat.py"
-with open(output_path, "w", encoding="utf-8") as f:
-    f.write(script)
-
-# Verify
-with open(output_path, "r", encoding="utf-8") as f:
-    saved = f.read()
-
-import ast
-try:
-    ast.parse(saved)
-    print("✓ Syntax valid")
-except SyntaxError as e:
-    print(f"✗ Syntax error: {e}")
-
-print(f"\nFile saved: {output_path}")
-print(f"Size: {len(saved)} chars")
-
-# Verify key strings
-print(f"\nVerification:")
-print(f"  IM_START = '<|im_start|>': {'IM_START = \"<|im_start|>\"' in saved}")
-print(f"  IM_END = '<|im_end|>': {'IM_END = \"<|im_end|>\"' in saved}")
-print(f"  instruction col: {'instruction' in saved}")
-print(f"  response col: {'response' in saved}")
-print(f"  formattedconversation: {'formattedconversation' in saved}")
-print(f"  tokencount: {'tokencount' in saved}")
-print(f"  filter < max_seq_len: {'tokencount < max_seq_len' in saved}")
-print(f"  databricks-dolly-: {'databricks-dolly-' in saved}")
-print(f"  push_to_hub: {'push_to_hub' in saved}")
